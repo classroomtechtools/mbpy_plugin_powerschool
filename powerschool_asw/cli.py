@@ -330,7 +330,7 @@ def sync(obj, date, postfix, associations, profiles, user, password, to_whom):
                     target_year_group = mb_year_groups.get(ps_student.tables.students.grade)
                     assert target_year_group is not None, 'Grade is wrong?'
                     if not record.get('id') in target_year_group.get('student_ids'):
-                        execute(mb.endpoints.add_to_year_group, records, f'{record.get("student_id")} > {ps_stu.tables.students.grade}', id=target_year_group.get('id'), body={
+                        execute(mb.endpoints.add_to_year_group, records, f'{record.get("student_id")} > {ps_student.tables.students.grade}', id=target_year_group.get('id'), body={
                             'student_ids': [record.get('id')]
                         })
 
