@@ -1,17 +1,17 @@
-import pdb
 import click
 from uplink import Consumer, RequestsClient, Body, Path, Query, post, returns, headers
 from types import SimpleNamespace
 import re
 import datetime
 from collections import defaultdict
-from mbpy_endpoints.endpoints import Endpoint
+from src.mbpy_endpoints.mbpy_endpoints.endpoints import Endpoint
 from json.decoder import JSONDecodeError
-from src.mbpy.db.utils import cache_install
 import pandas as pd
 import flatdict
 import os
 
+BASEURL = ""  # PowerSchool Base url
+OAUTH_BASEURL = ""  # PowerSchool oauth token baseurl
 
 def dot(data):
     if type(data) is list:
@@ -77,7 +77,7 @@ def send_email(from_, send_to, subject, body, password, *dataframes):
 @headers({"Content-Type": "application/x-www-form-urlencoded"})
 class GetToken(Consumer):
     def __init__(self, client_id, client_secret, client=RequestsClient):
-        base_url = "https://psweb.asw.waw.pl/"
+        base_url = OAUTH_BASEURL
         super(GetToken, self).__init__(base_url=base_url, client=client)
         bearer_token = base64.b64encode(
             bytes(client_id + ":" + client_secret, "ISO-8859-1")
@@ -102,7 +102,7 @@ class PsWeb(Consumer):
         if access_token is None:
             raise Exception("No access token returned!")
 
-        base_url = "https://psweb.asw.waw.pl/ws/schema/query/"
+        base_url = BASEURL
         super(PsWeb, self).__init__(base_url=base_url, client=client)
         self.session.headers["Authorization"] = f"Bearer {access_token}"
 
@@ -229,42 +229,73 @@ def execute(mb: Endpoint, records, description, *args, **kwargs):
     return response
 
 
-@click.command("sync-asw")
+@click.command("powerschool")
 @click.option(
     "-d",
     "--date",
     "date",
     type=click.DateTime(formats=["%Y-%m-%d"]),
     default=str(datetime.date.today()),
-    help="The date on which to execute",
+    help="The value for parameter `class_happens_on` in the 'Get all Classes' MB endpoint.",
 )
-@click.option("-x", "--postfix", "postfix", default="")
+@click.option("-x", "--postfix", "postfix", default="", hidden=True)
 @click.option(
-    "-a", "--associate/--skip-associations", "associations", is_flag=True, default=False
+    "-a",
+    "--associate-relationships/--skip-associations",
+    "associations",
+    is_flag=True,
+    default=False,
+    help="Whether to associate children and parents.  May use significant processing time.",
 )
 @click.option(
-    "-p", "--skip-profile/--update-profile", "profiles", is_flag=True, default=False
+    "-p",
+    "--skip-profile/--update-profile",
+    "profiles",
+    is_flag=True,
+    default=False,
+    help="Whether to keep the profile fields in sync.",
 )
-@click.option("-u", "--user", "user", default=os.environ.get("USER"))
-@click.option("-w", "--password", "password", default=os.environ.get("PASSWORD"))
-@click.option("-t", "--to", "to_whom", default=[], multiple=True)
+@click.option(
+    "-c", "--client_id", "client_id", allow_from_autoenv=True, show_envvar=True, help="Client ID for the ps oauth endpoint"
+)
+@click.option(
+    "-s", "--client_secret", "client_secret", allow_from_autoenv=True, show_envvar=True, help="Client secret for the ps oauth endpoint"
+)
+@click.option(
+    "-u", "--smtp_user", "smtp_user", allow_from_autoenv=True, show_envvar=True
+)
+@click.option(
+    "-w", "--smtp_password", "smtp_password", allow_from_autoenv=True, show_envvar=True
+)
+@click.option(
+    "-t", "--to", "to_whom", default=[], multiple=True, help="Emails to send the log to"
+)
 @click.pass_obj
-def sync(obj, date, postfix, associations, profiles, user, password, to_whom):
+def sync(
+    obj,
+    date,
+    postfix,
+    associations,
+    profiles,
+    client_id,
+    client_secret,
+    smtp_user,
+    smtp_password,
+    to_whom,
+):
     """
-    Specialist software written for American School Warsaw
+    Syncronize PowerSchool to ManageBac
     """
-    if len(to_whom) > 0 and not password:
+    if len(to_whom) > 0 and not smtp_password:
         raise Exception("Please provide password to send email")
-
-    from mbpy_endpoints import Generator
 
     date_string = date.strftime("%Y-%m-%d")
 
     mb = obj.Generator
 
     api = PsWeb(
-        client_id=CLIENT_ID,
-        client_secret=CLIENT_SECRET,
+        client_id=client_id,
+        client_secret=client_secret,
     )
 
     psdf_enrollments, ps_student_enrollments, _ = load_enrollments(api)
@@ -305,7 +336,7 @@ def sync(obj, date, postfix, associations, profiles, user, password, to_whom):
                     mb.endpoints.unarchive_a_student,
                     records,
                     stu_id,
-                    id=mb_student.get("id")
+                    id=mb_student.get("id"),
                 )
             if mb_student is None:
                 day, month, year = ps_student.tables.students.dateofbirth.split("-")
@@ -525,7 +556,6 @@ def sync(obj, date, postfix, associations, profiles, user, password, to_whom):
         for memb in mb.generate_memberships(
             class_happens_on=date_string, classes="active", users="active", per_page=200
         ):
-
             membership = dot(memb)
             clss = mb_classes.get(
                 membership.uniq_class_id
@@ -835,7 +865,7 @@ def sync(obj, date, postfix, associations, profiles, user, password, to_whom):
 
         if len(to_whom) > 0:
             send_email(
-                user,
+                smtp_user,
                 to_whom,
                 f'Sync Output {"(" if subject_description else ""}{subject_description.strip()}{")" if subject_description else ""}',
                 body,
