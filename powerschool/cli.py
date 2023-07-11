@@ -4,11 +4,11 @@ from types import SimpleNamespace
 import re
 import datetime
 from collections import defaultdict
-from src.mbpy_endpoints.mbpy_endpoints.endpoints import Endpoint
+from mbpy_endpoints.mbpy_endpoints.endpoints import Endpoint
 from json.decoder import JSONDecodeError
 import pandas as pd
 import flatdict
-import os
+
 
 BASEURL = ""  # PowerSchool Base url
 OAUTH_BASEURL = ""  # PowerSchool oauth token baseurl
@@ -77,8 +77,8 @@ def send_email(from_, send_to, subject, body, password, *dataframes):
 
 @headers({"Content-Type": "application/x-www-form-urlencoded"})
 class GetToken(Consumer):
-    def __init__(self, client_id, client_secret, client=RequestsClient):
-        base_url = OAUTH_BASEURL
+    def __init__(self, client_id, client_secret, oauth_baseurl, client=RequestsClient):
+        base_url = oauth_baseurl
         super(GetToken, self).__init__(base_url=base_url, client=client)
         bearer_token = base64.b64encode(
             bytes(client_id + ":" + client_secret, "ISO-8859-1")
@@ -96,14 +96,13 @@ import base64
 
 @headers({"Content-Type": "application/json"})
 class PsWeb(Consumer):
-    def __init__(self, client_id, client_secret, client=RequestsClient):
-        auth = GetToken(client_id, client_secret)
+    def __init__(self, client_id, client_secret, ps_oauth_baseurl, base_url, client=RequestsClient):
+        auth = GetToken(client_id, client_secret, ps_oauth_baseurl=ps_oauth_baseurl)
         response = auth.get_access_token().json()
         access_token = response.get("access_token")
         if access_token is None:
             raise Exception("No access token returned!")
 
-        base_url = BASEURL
         super(PsWeb, self).__init__(base_url=base_url, client=client)
         self.session.headers["Authorization"] = f"Bearer {access_token}"
 
@@ -257,6 +256,23 @@ def execute(mb: Endpoint, records, description, *args, **kwargs):
     help="Whether to keep the profile fields in sync.",
 )
 @click.option(
+    '--provision-only',
+    default=False
+)
+@click.option(
+    '-b',
+    '--base-url',
+    'ps_base_url',
+    allow_from_autoenv=True,
+    show_envvar=True
+)
+@click.option(
+    '--ps-oauth-url',
+    'ps_oauth_url',
+    allow_from_autoenv=True,
+    show_envvar=True
+)
+@click.option(
     "-c",
     "--client_id",
     "client_id",
@@ -288,6 +304,9 @@ def sync(
     postfix,
     associations,
     profiles,
+    provision_only,
+    ps_base_url,
+    ps_oauth_url,
     client_id,
     client_secret,
     smtp_user,
@@ -307,6 +326,8 @@ def sync(
     api = PsWeb(
         client_id=client_id,
         client_secret=client_secret,
+        base_url=ps_base_url,
+        ps_oauth_baseurl=ps_oauth_url
     )
 
     psdf_enrollments, ps_student_enrollments, _ = load_enrollments(api)
@@ -741,94 +762,95 @@ def sync(
                         withdrawn_on=date_query_param,
                     )
 
-        print("SSs who need CLASSES to be REMOVED")
-        for stu_id in to_be_removed:
-            for class_id in to_be_removed[stu_id]:
-                item = to_be_removed[stu_id][class_id]
-                mb_student = item.student
-                mb_class = item.clss
-                execute(
-                    mb.endpoints.remove_students_from_class,
-                    records,
-                    f"{class_id} < {stu_id}",
-                    class_id=mb_class.get("id"),
-                    body={"student_ids": [mb_student.get("id")]},
-                )
-
-        print("SS to be UPDATED")
-        for stu_id in fields_to_be_updated:
-            for property in fields_to_be_updated[stu_id]:
-                mb_student = mb_students.get(
-                    stu_id
-                )  # session.query(Student).where(Student.student_id==stu_id).one()
-
-                value = fields_to_be_updated[stu_id][property]
-                if property == "nationalities":
-                    value = [value]
-
-                body = {"student": {}}
-                body["student"][property] = value
-                execute(
-                    mb.endpoints.update_a_student,
-                    records,
-                    f"{stu_id}.{property} = {value}",
-                    id=mb_student.get("id"),
-                    body=body,
-                )
-
-        print("SS to be ADDED to CLASS")
-        # classes that student is supposed to be enrolled in according to PS, but not in MB yet
-        academic_years = mb.endpoints.get_academic_years()
-
-        for stud_id in ps_student_enrollments:
-            ps_stu = ps_students.get(stud_id)
-            ps_enrol = list(ps_student_enrollments[stud_id].keys())
-            mb_enrol = mb_student_enrollments[stud_id]
-            mb_student = mb_students.get(stud_id)
-
-            if mb_student is None:
-                continue  # dev, new students won't be there yet
-
-            for add in set(ps_enrol) - set(mb_enrol):
-                clss = mb_classes.get(add)
-                if clss is None:
-                    missing_classes.append(
-                        {"description": add, "error": True, "body": stu_id}
+        if not provision_only:
+            print("SSs who need CLASSES to be REMOVED")
+            for stu_id in to_be_removed:
+                for class_id in to_be_removed[stu_id]:
+                    item = to_be_removed[stu_id][class_id]
+                    mb_student = item.student
+                    mb_class = item.clss
+                    execute(
+                        mb.endpoints.remove_students_from_class,
+                        records,
+                        f"{class_id} < {stu_id}",
+                        class_id=mb_class.get("id"),
+                        body={"student_ids": [mb_student.get("id")]},
                     )
-                else:
-                    # FIXME: Check that the class has begun, it's possible to be in the source but not intended to be enrolled in MB yet
-                    # as it wouldn't be able to remove them, either
-                    years = academic_years.get(clss.get("program_code"))
-                    if not years:
-                        continue
-                    years = years.get("academic_years")
-                    start_date = None
-                    for terms in years:
-                        for term in terms.get("academic_terms"):
-                            if term.get("id") == clss.get("start_term_id"):
-                                # use datetime as click's date param will need to be compared to it
-                                start_date = datetime.datetime.fromisoformat(
-                                    term.get("starts_on")
-                                )
-                    assert start_date is not None, "start_date cannot be None"
-                    if start_date <= date:
-                        execute(
-                            mb.endpoints.add_student_to_class,
-                            records,
-                            f'{stud_id} > {clss.get("uniq_id")}',
-                            class_id=clss.get("id"),
-                            body={"student_ids": [mb_student.get("id")]},
+
+            print("SS to be UPDATED")
+            for stu_id in fields_to_be_updated:
+                for property in fields_to_be_updated[stu_id]:
+                    mb_student = mb_students.get(
+                        stu_id
+                    )  # session.query(Student).where(Student.student_id==stu_id).one()
+
+                    value = fields_to_be_updated[stu_id][property]
+                    if property == "nationalities":
+                        value = [value]
+
+                    body = {"student": {}}
+                    body["student"][property] = value
+                    execute(
+                        mb.endpoints.update_a_student,
+                        records,
+                        f"{stu_id}.{property} = {value}",
+                        id=mb_student.get("id"),
+                        body=body,
+                    )
+
+            print("SS to be ADDED to CLASS")
+            # classes that student is supposed to be enrolled in according to PS, but not in MB yet
+            academic_years = mb.endpoints.get_academic_years()
+
+            for stud_id in ps_student_enrollments:
+                ps_stu = ps_students.get(stud_id)
+                ps_enrol = list(ps_student_enrollments[stud_id].keys())
+                mb_enrol = mb_student_enrollments[stud_id]
+                mb_student = mb_students.get(stud_id)
+
+                if mb_student is None:
+                    continue  # dev, new students won't be there yet
+
+                for add in set(ps_enrol) - set(mb_enrol):
+                    clss = mb_classes.get(add)
+                    if clss is None:
+                        missing_classes.append(
+                            {"description": add, "error": True, "body": stu_id}
                         )
                     else:
-                        records.append(
-                            {
-                                "description": f"{mb_student.get('student_id')} > {clss.get('uniq_id')}",
-                                "error": False,
-                                "change": False,
-                                "body": "Not enrolling as class has not begun",
-                                "action": "Enrol into class not yet started",
-                            }
-                        )
+                        # FIXME: Check that the class has begun, it's possible to be in the source but not intended to be enrolled in MB yet
+                        # as it wouldn't be able to remove them, either
+                        years = academic_years.get(clss.get("program_code"))
+                        if not years:
+                            continue
+                        years = years.get("academic_years")
+                        start_date = None
+                        for terms in years:
+                            for term in terms.get("academic_terms"):
+                                if term.get("id") == clss.get("start_term_id"):
+                                    # use datetime as click's date param will need to be compared to it
+                                    start_date = datetime.datetime.fromisoformat(
+                                        term.get("starts_on")
+                                    )
+                        assert start_date is not None, "start_date cannot be None"
+                        if start_date <= date:
+                            execute(
+                                mb.endpoints.add_student_to_class,
+                                records,
+                                f'{stud_id} > {clss.get("uniq_id")}',
+                                class_id=clss.get("id"),
+                                body={"student_ids": [mb_student.get("id")]},
+                            )
+                        else:
+                            records.append(
+                                {
+                                    "description": f"{mb_student.get('student_id')} > {clss.get('uniq_id')}",
+                                    "error": False,
+                                    "change": False,
+                                    "body": "Not enrolling as class has not begun",
+                                    "action": "Enrol into class not yet started",
+                                }
+                            )
 
     finally:
         timestamp = f"{date_string}{postfix}"
