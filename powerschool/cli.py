@@ -13,6 +13,7 @@ import os
 BASEURL = ""  # PowerSchool Base url
 OAUTH_BASEURL = ""  # PowerSchool oauth token baseurl
 
+
 def dot(data):
     if type(data) is list:
         return list(map(dot, data))
@@ -256,10 +257,20 @@ def execute(mb: Endpoint, records, description, *args, **kwargs):
     help="Whether to keep the profile fields in sync.",
 )
 @click.option(
-    "-c", "--client_id", "client_id", allow_from_autoenv=True, show_envvar=True, help="Client ID for the ps oauth endpoint"
+    "-c",
+    "--client_id",
+    "client_id",
+    allow_from_autoenv=True,
+    show_envvar=True,
+    help="Client ID for the ps oauth endpoint",
 )
 @click.option(
-    "-s", "--client_secret", "client_secret", allow_from_autoenv=True, show_envvar=True, help="Client secret for the ps oauth endpoint"
+    "-s",
+    "--client_secret",
+    "client_secret",
+    allow_from_autoenv=True,
+    show_envvar=True,
+    help="Client secret for the ps oauth endpoint",
 )
 @click.option(
     "-u", "--smtp_user", "smtp_user", allow_from_autoenv=True, show_envvar=True
