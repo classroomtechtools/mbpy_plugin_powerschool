@@ -4,10 +4,11 @@ from types import SimpleNamespace
 import re
 import datetime
 from collections import defaultdict
-from mbpy_endpoints.mbpy_endpoints.endpoints import Endpoint
+from mbpy_endpoints.endpoints import Endpoint
 from json.decoder import JSONDecodeError
 import pandas as pd
 import flatdict
+from mbpy.cli.contexts import pass_settings_context
 
 
 BASEURL = ""  # PowerSchool Base url
@@ -77,8 +78,8 @@ def send_email(from_, send_to, subject, body, password, *dataframes):
 
 @headers({"Content-Type": "application/x-www-form-urlencoded"})
 class GetToken(Consumer):
-    def __init__(self, client_id, client_secret, oauth_baseurl, client=RequestsClient):
-        base_url = oauth_baseurl
+    def __init__(self, client_id, client_secret, ps_oauth_baseurl, client=RequestsClient):
+        base_url = ps_oauth_baseurl
         super(GetToken, self).__init__(base_url=base_url, client=client)
         bearer_token = base64.b64encode(
             bytes(client_id + ":" + client_secret, "ISO-8859-1")
@@ -146,9 +147,14 @@ def load_entity(api, entity, path):
         dict(flatdict.FlatDict(item, delimiter=".")) for item in records
     ]
     df = pd.DataFrame.from_records(flattened_records)
-    df.to_csv(f"/tmp/output_{entity}.csv", index=False)
+    df.to_csv(f"~/outputs/output_{entity}.csv", index=False)
     for item in records:
         value = get_dotted_path(item, path)
+        if entity == 'teachers':
+            if not item['tables']['teachers']['id']:
+                continue
+            value = value.lower()
+            item['tables']['teachers']['id'] = item['tables']['teachers']['id'].lower()
         objects[value] = dot(item)
     return (df, objects)
 
@@ -208,6 +214,8 @@ def execute(mb: Endpoint, records, description, *args, **kwargs):
         record = {
             "description": description,
             "action": mb.__name__,
+            "args": ', '.join(args),
+            "kwargs": ', '.join(f"{k}={v}" for k, v in kwargs.items()),
             "change": True,
             "error": bool(response.get("error")),
             "response": response,
@@ -227,6 +235,43 @@ def execute(mb: Endpoint, records, description, *args, **kwargs):
     record.update(kwargs)
     records.append(record)
     return response
+
+
+def full_name_to_mb_teacher(ps_stu, mb_teachers, psdf_teachers, records):
+    homeroom_teacher_df = psdf_teachers.loc[psdf_teachers['full_name']==ps_stu.tables.students.home_room]
+    if not homeroom_teacher_df.empty:
+        hr_teacher_records = homeroom_teacher_df.to_dict(orient='records')
+        if len(hr_teacher_records) > 1:
+            records.append(
+                {
+                    "description": ps_stu.tables.students.home_room,
+                    "action": "field_check",
+                    "error": True,
+                    "change": False,
+                    "response": hr_teacher_records.to_string(),
+                    "body": "",
+                }
+            )
+        else:
+            homeroom_teacher_record = hr_teacher_records.pop()
+            homeroom_teacher_email = homeroom_teacher_record.get('tables.teachers.id')
+            homeroom_teacher_email = homeroom_teacher_email.lower()
+            mb_teacher = mb_teachers.get(homeroom_teacher_email)
+            if not mb_teacher:
+                print(f'No teacher with this email? {homeroom_teacher_email}')
+                records.append(
+                    {
+                        "description": f"{homeroom_teacher_email} not in MB",
+                        "action": "field_check",
+                        "error": True,
+                        "change": False,
+                        "response": None,
+                        "body": "",
+                    }
+                )
+            return mb_teacher.get('id')
+    return None
+
 
 
 @click.command("powerschool")
@@ -249,15 +294,16 @@ def execute(mb: Endpoint, records, description, *args, **kwargs):
 )
 @click.option(
     "-p",
-    "--skip-profile/--update-profile",
+    "--update-profile/--skip-profile",
     "profiles",
     is_flag=True,
-    default=False,
+    default=True,
     help="Whether to keep the profile fields in sync.",
 )
 @click.option(
     '--provision-only',
-    default=False
+    default=False,
+    is_flag=True
 )
 @click.option(
     '-b',
@@ -297,7 +343,8 @@ def execute(mb: Endpoint, records, description, *args, **kwargs):
 @click.option(
     "-t", "--to", "to_whom", default=[], multiple=True, help="Emails to send the log to"
 )
-@click.pass_obj
+#@click.pass_obj
+@pass_settings_context
 def sync(
     obj,
     date,
@@ -337,6 +384,11 @@ def sync(
     )
 
     psdf_teachers, teachers = load_entity(api, "teachers", "tables.teachers.id")
+    # add lowercased emails
+    psdf_teachers = psdf_teachers.dropna(subset=['tables.teachers.id'])
+    psdf_teachers['tables.teachers.id'] = psdf_teachers['tables.teachers.id'].apply(str.lower)
+    psdf_teachers['full_name'] = psdf_teachers.apply(lambda row: row['tables.teachers.last_name'] + ', ' + row['tables.teachers.first_name'] + (' ' + row['tables.teachers.middle_name'] if row['tables.teachers.middle_name'] else ''), axis=1)
+
     psdf_parents, parents = load_entity(
         api, "parents", "tables.students.student_number"
     )
@@ -350,9 +402,9 @@ def sync(
     try:
         mb_year_groups = {}
         for year_group in mb.generate_year_groups():
-            mb_year_groups[year_group.get("grade")] = year_group
+            if not year_group.get('id') in [10543690]:
+                mb_year_groups[year_group.get("grade_number")] = year_group
 
-        print("Creating accounts")
         mb_students = {}
         for student in mb.generate_students():
             student_id = student.get("student_id")
@@ -361,8 +413,58 @@ def sync(
         today: datetime.date = datetime.datetime.today().date()
         date_query_param = today.strftime("%Y-%m-%d")
 
+        for stu_id, mb_student in mb_students.items():
+            ps_student = ps_students.get(stu_id)
+            if ps_student is None:
+                if not mb_student.get('archived') and not len(set(mb_student.get('student_id'))) == 1:
+                    execute(
+                        mb.endpoints.archive_a_student,
+                        records,
+                        stu_id,
+                        id=mb_student.get("id"),
+                        withdrawn_on=date_query_param,
+                    )
+
+
+        ## Have to process teachers here first
+
+        mb_teachers = {}
+        for teacher in mb.generate_teachers():
+            email = teacher.get("email").lower()
+            mb_teachers[email] = teacher
+
+        # filter out None emails
+        for email, ps_teacher in [(e, t) for e, t in teachers.items() if e]:
+            mb_teach = mb_teachers.get(email)
+            if mb_teach is None:
+                body = {
+                    "teacher": {
+                        "email": ps_teacher.tables.teachers.id,
+                        "first_name": ps_teacher.tables.teachers.first_name,
+                        "last_name": ps_teacher.tables.teachers.last_name,
+                        "middle_name": ps_teacher.tables.teachers.middle_name,
+                    }
+                }
+                new_teacher = execute(
+                    mb.endpoints.create_teacher, records, email, body=body
+                )
+                if not "id" in new_teacher:
+                    if error := new_teacher.get("errors"):
+                        print(error)
+                    print(f"Not adding teacher {email}")
+                    continue  # dev
+                mb_teachers[email] = new_teacher
+
+
         for stu_id, ps_student in ps_students.items():
             mb_student = mb_students.get(stu_id)
+            student_grade = ''.join(ps_student.tables.students.grade[1:])
+            if student_grade.isdigit():
+                class_grade_number = int(student_grade) + 1
+            else:
+                class_grade_number = {
+                    'KG': 1,
+                }.get(ps_student.tables.students.grade)
             if not mb_student is None and mb_student.get("archived"):
                 execute(
                     mb.endpoints.unarchive_a_student,
@@ -372,9 +474,6 @@ def sync(
                 )
             if mb_student is None:
                 day, month, year = ps_student.tables.students.dateofbirth.split("-")
-                class_grade_number = (
-                    int(ps_student.tables.students.grade.split(" ")[1]) + 1
-                )
                 body = {
                     "student": {
                         "student_id": stu_id,
@@ -383,14 +482,24 @@ def sync(
                         "last_name": ps_student.tables.students.last_name,
                         "first_name": ps_student.tables.students.first_name,
                         "email": ps_student.tables.students.email,
-                        "nickname": ps_student.tables.u_student_additionals.nickname,
+                        #"nickname": ps_student.tables.u_student_additionals.nickname,
                         "gender": {"F": "Female", "M": "Male"}.get(
                             ps_student.tables.students.gender
                         ),
-                        "nationalities": ps_student.tables.u_country_codes.nat,
+                        #"nationalities": ps_student.tables.u_country_codes.nat,
                         "class_grade_number": class_grade_number,
                     }
                 }
+                # Map home_room teacher to other_name
+                if ps_student.tables.students.house_name:
+                    body['student']['other_name'] = ps_student.tables.students.house_name
+
+                homeroom_advisor_id = full_name_to_mb_teacher(ps_student, mb_teachers, psdf_teachers, records)
+
+                # Map home_room to homeroom teacher
+                if homeroom_advisor_id:
+                     body['student']['homeroom_advisor_id'] = homeroom_advisor_id
+
                 new_student = execute(
                     mb.endpoints.create_student, records, stu_id, body=body
                 )
@@ -413,7 +522,7 @@ def sync(
 
                     # FIXME: add them to the right year group
                     target_year_group = mb_year_groups.get(
-                        ps_student.tables.students.grade
+                        class_grade_number
                     )
                     assert target_year_group is not None, "Grade is wrong?"
                     if not record.get("id") in target_year_group.get("student_ids"):
@@ -430,31 +539,162 @@ def sync(
                         continue  # dev
                     mb_students[stu_id] = record
 
-        mb_teachers = {}
-        for teacher in mb.generate_teachers():
-            email = teacher.get("email").lower()
-            mb_teachers[email] = teacher
+            else:
+                uniq_student_id = mb_student.get('student_id')
+                if ps_stu := ps_students.get(uniq_student_id):
+                    # ensure enrolled into correct year_group
+                    target_year_group = mb_year_groups.get(class_grade_number)
+                    if target_year_group is None:
+                        raise Exception(f"No year group for {class_grade_number}")
+                    assert target_year_group is not None, "Grade is wrong?"
+                    if not mb_student.get("id") in target_year_group.get("student_ids"):
+                        execute(
+                            mb.endpoints.add_to_year_group,
+                            records,
+                            f'{mb_student.get("student_id")} > {target_year_group.get("name")}',
+                            id=target_year_group.get("id"),
+                            body={"student_ids": [mb_student.get("id")]},
+                        )
 
-        for email, ps_teacher in teachers.items():
-            mb_teach = mb_teachers.get(email)
-            if mb_teach is None:
-                body = {
-                    "teacher": {
-                        "email": ps_teacher.tables.teachers.id,
-                        "first_name": ps_teacher.tables.teachers.first_name,
-                        "last_name": ps_teacher.tables.teachers.last_name,
-                        "middle_name": ps_teacher.tables.teachers.middle_name,
-                    }
-                }
-                new_teacher = execute(
-                    mb.endpoints.create_teacher, records, email, body=body
-                )
-                if not "id" in new_teacher:
-                    if error := new_teacher.get("errors"):
-                        print(error)
-                    print(f"Not adding teacher {email}")
-                    continue  # dev
-                mb_teachers[email] = new_teacher
+                    if profiles:
+                        # if ps_stu.tables.students.grade != mb_student.get("class_grade"):
+                        #     # FIXME: This doesn't seem to be working
+                        #     execute(
+                        #         mb.endpoints.update_a_student,
+                        #         records,
+                        #         mb_student.get("student_id"),
+                        #         id=mb_student.get("id"),
+                        #         body={
+                        #             "student": {
+                        #                 "class_grade_number": int(
+                        #                     ps_stu.tables.students.grade.split(" ")[1]
+                        #                 )
+                        #                 + 1
+                        #             }
+                        #         },
+                        #     )
+                        # ps_birthday = datetime.datetime.strptime(
+                        #     ps_stu.tables.u_student_additionals.enrollmentdate, '%d-%m-%Y').date()
+                        dates_checks = (
+                            # ('attendance_start_date', mb_student.attendance_start_date, ps_stu.tables.u_student_additionals.enrollmentdate),
+                            (
+                                "birthday",
+                                mb_student.get("birthday"),
+                                ps_stu.tables.students.dateofbirth,
+                            ),
+                        )
+                        for property, mb_, ps_ in dates_checks:
+                            if not ps_ is None:
+                                ps_date = datetime.datetime.strptime(ps_, "%d-%m-%Y").date()
+                                if not mb_ is None:
+                                    mb_date = datetime.datetime.strptime(
+                                        mb_, "%Y-%m-%d"
+                                    ).date()
+                                    if ps_date != mb_date:
+                                        # incorrect
+                                        fields_to_be_updated[uniq_student_id][
+                                            property
+                                        ] = ps_date.isoformat()
+                                else:
+                                    # blank
+                                    fields_to_be_updated[uniq_student_id][
+                                        property
+                                    ] = ps_date.isoformat()
+                            else:
+                                if not mb_ is None:
+                                    fields_to_be_updated[uniq_student_id][property] = None
+
+                        field_checks = [
+                            (
+                                "email",
+                                mb_student.get("email"),
+                                ps_stu.tables.students.email,
+                            ),
+                            (
+                                "last_name",
+                                mb_student.get("last_name"),
+                                ps_stu.tables.students.last_name,
+                            ),
+                            (
+                                "first_name",
+                                mb_student.get("first_name"),
+                                ps_stu.tables.students.first_name,
+                            ),
+                            (
+                                "middle_name",
+                                mb_student.get("middle_name"),
+                                ps_stu.tables.students.middle_name,
+                            ),
+                            (
+                                "other_name",
+                                mb_student.get('other_name'),
+                                ps_stu.tables.students.house_name,
+                            ),
+                            # (
+                            #     "class_grade",
+                            #     mb_student.get("class_grade"),
+                            #     ps_stu.tables.students.grade,
+                            # ),
+                            # ('nationalities', (mb_student.get('nationalities') or [None]).pop(),
+                            #    ps_stu.tables.u_country_codes.nat),
+                            (
+                                "gender",
+                                mb_student.get("gender"),
+                                {"M": "Male", "F": "Female"}.get(
+                                    ps_stu.tables.students.gender
+                                ),
+                            ),
+                        ]
+
+                        mb_homeroom_teacher_id = full_name_to_mb_teacher(ps_stu, mb_teachers, psdf_teachers, records)
+                        if mb_homeroom_teacher_id:
+                            field_checks.append((
+                                "homeroom_advisor_id",
+                                mb_student.get("homeroom_advisor_id"),
+                                mb_homeroom_teacher_id,
+                            ))
+
+                        for property, mb_value, ps_value in field_checks:
+                            if not ps_value is None:
+                                if not mb_value is None:
+                                    if ps_value != mb_value:
+                                        fields_to_be_updated[uniq_student_id][
+                                            property
+                                        ] = ps_value
+                                else:
+                                    fields_to_be_updated[uniq_student_id][
+                                        property
+                                    ] = ps_value
+                            else:
+                                if mb_value:
+                                    fields_to_be_updated[uniq_student_id][property] = None
+
+                        for key in [
+                            k
+                            for k in mb_year_groups.keys()
+                            if not k == class_grade_number
+                        ]:
+                            year_group = mb_year_groups[key]
+                            if mb_student.get("id") in year_group.get("student_ids"):
+                                execute(
+                                    mb.endpoints.remove_from_year_group,
+                                    records,
+                                    f'{year_group.get("name")} < {mb_student.get("student_id")}',
+                                    id=year_group.get("id"),
+                                    body={"student_ids": [mb_student.get("id")]},
+                                )
+                        # ensure removed from other year_groups
+
+                else:
+                    # TODO: Does not reach here
+                    execute(
+                        mb.endpoints.archive_a_student,
+                        records,
+                        mb_student.get("student_id"),
+                        id=mb_student.get("id"),
+                        withdrawn_on=date_query_param,
+                        )
+
 
         mb_parents = {}
         for parent in mb.generate_parents():
@@ -469,11 +709,14 @@ def sync(
                 continue  # can occur in dev environment
 
             # link parents to students
-            base = ps_parent.tables.u_student_additionals
             parent_list = []
-            for par in ["mother", "father"]:
-                kind = par.title()
-                email = getattr(base, f"{par}_school_email")
+            for par in ["guardian1", "guardian2"]:
+                base = ps_parent
+                email = getattr(base.tables.emailaddress, f"{par}_email")
+                if hasattr(base.tables.codeset, f"{par}_relationship"):
+                    role = getattr(base.tables.codeset, f"{par}_relationship")
+                else:
+                    role = par
                 if email is None:
                     records.append(
                         {
@@ -481,23 +724,23 @@ def sync(
                             "action": "missing_email",
                             "error": False,
                             "change": False,
-                            "response": f"{stu_id} has no parent email for {kind}",
+                            "response": f"{stu_id} has no parent email for {par}",
                             "body": "",
                         }
                     )
                     continue
-                split = email.split("@")[0].split("_")
-                first_name = f"{par}_first_name"
+                handle = email.split("@")[0]
+                first_name = f"{par}_firstname"
                 first_name = (
-                    getattr(base, first_name) if hasattr(base, first_name) else split[1]
+                    getattr(base.tables.person, first_name) if hasattr(base.tables.person, first_name) else handle
                 )
-                last_name = f"{par}_last_name"
+                last_name = f"{par}_lastname"
                 last_name = (
-                    getattr(base, last_name) if hasattr(base, last_name) else split[0]
+                    getattr(base.tables.person, last_name) if hasattr(base.tables.person, last_name) else handle
                 )
                 parent_list.append(
                     (
-                        kind,
+                        role,
                         {
                             "email": email,
                             "first_name": first_name.title(),
@@ -579,6 +822,7 @@ def sync(
             uniq_id = clss.get("uniq_id")
             clss["archived"] = False
             mb_classes[uniq_id] = clss
+
         for clss in mb.generate_classes(archived=True):
             uniq_id = clss.get("uniq_id")
             assert uniq_id not in clss, "Class uniq IDs are not unique"
@@ -609,161 +853,14 @@ def sync(
                 )  # session.get(Student, membership.user_id)
                 clss = mb_classes.get(membership.uniq_class_id)
 
-                if enrolled := ps_student_enrollments[uniq_student_id][uniq_class_id]:
-                    pass  # print(enrolled)
-                else:
-                    to_be_removed[uniq_student_id][uniq_class_id] = SimpleNamespace(
-                        student=mb_student, clss=clss
-                    )
-
-                if ps_stu := ps_students.get(uniq_student_id):
-                    # ensure enrolled into correct year_group
-                    target_year_group = mb_year_groups.get(ps_stu.tables.students.grade)
-                    assert target_year_group is not None, "Grade is wrong?"
-                    if not mb_student.get("id") in target_year_group.get("student_ids"):
-                        execute(
-                            mb.endpoints.add_to_year_group,
-                            records,
-                            f'{mb_student.get("student_id")} > {ps_stu.tables.students.grade}',
-                            id=target_year_group.get("id"),
-                            body={"student_ids": [mb_student.get("id")]},
-                        )
-
-                    if not profiles:
-                        # stop here unless we need to update profiles
-                        continue
-
-                    if ps_stu.tables.students.grade != mb_student.get("class_grade"):
-                        # FIXME: This doesn't seem to be working
-                        execute(
-                            mb.endpoints.update_a_student,
-                            records,
-                            mb_student.get("student_id"),
-                            id=mb_student.get("id"),
-                            body={
-                                "student": {
-                                    "class_grade_number": int(
-                                        ps_stu.tables.students.grade.split(" ")[1]
-                                    )
-                                    + 1
-                                }
-                            },
-                        )
-                    # ps_birthday = datetime.datetime.strptime(
-                    #     ps_stu.tables.u_student_additionals.enrollmentdate, '%d-%m-%Y').date()
-                    dates_checks = (
-                        # ('attendance_start_date', mb_student.attendance_start_date, ps_stu.tables.u_student_additionals.enrollmentdate),
-                        (
-                            "birthday",
-                            mb_student.get("birthday"),
-                            ps_stu.tables.students.dateofbirth,
-                        ),
-                    )
-                    for property, mb_, ps_ in dates_checks:
-                        if not ps_ is None:
-                            ps_date = datetime.datetime.strptime(ps_, "%d-%m-%Y").date()
-                            if not mb_ is None:
-                                mb_date = datetime.datetime.strptime(
-                                    mb_, "%Y-%m-%d"
-                                ).date()
-                                if ps_date != mb_date:
-                                    # incorrect
-                                    fields_to_be_updated[uniq_student_id][
-                                        property
-                                    ] = ps_date.isoformat()
-                            else:
-                                # blank
-                                fields_to_be_updated[uniq_student_id][
-                                    property
-                                ] = ps_date.isoformat()
-                        else:
-                            if not mb_ is None:
-                                fields_to_be_updated[uniq_student_id][property] = None
-
-                    field_checks = (
-                        (
-                            "email",
-                            mb_student.get("email"),
-                            ps_stu.tables.students.email,
-                        ),
-                        (
-                            "last_name",
-                            mb_student.get("last_name"),
-                            ps_stu.tables.students.last_name,
-                        ),
-                        (
-                            "first_name",
-                            mb_student.get("first_name"),
-                            ps_stu.tables.students.first_name,
-                        ),
-                        (
-                            "middle_name",
-                            mb_student.get("middle_name"),
-                            ps_stu.tables.students.middle_name,
-                        ),
-                        (
-                            "nickname",
-                            mb_student.get("nickname"),
-                            ps_stu.tables.u_student_additionals.nickname,
-                        ),
-                        (
-                            "class_grade",
-                            mb_student.get("class_grade"),
-                            ps_stu.tables.students.grade,
-                        ),
-                        # ('nationalities', (mb_student.get('nationalities') or [None]).pop(),
-                        #    ps_stu.tables.u_country_codes.nat),
-                        (
-                            "gender",
-                            mb_student.get("gender"),
-                            {"M": "Male", "F": "Female"}.get(
-                                ps_stu.tables.students.gender
-                            ),
-                        ),
-                    )
-
-                    for property, mb_value, ps_value in field_checks:
-                        if not ps_value is None:
-                            if not mb_value is None:
-                                if ps_value != mb_value:
-                                    fields_to_be_updated[uniq_student_id][
-                                        property
-                                    ] = ps_value
-                            else:
-                                fields_to_be_updated[uniq_student_id][
-                                    property
-                                ] = ps_value
-                        else:
-                            if not mb_value is None:
-                                fields_to_be_updated[uniq_student_id][property] = None
-
-                    for key in [
-                        k
-                        for k in mb_year_groups.keys()
-                        if not k == ps_stu.tables.students.grade
-                    ]:
-                        year_group = mb_year_groups[key]
-                        if mb_student.get("id") in year_group.get("student_ids"):
-                            execute(
-                                mb.endpoints.remove_from_year_group,
-                                records,
-                                f'{ps_stu.tables.students.grade} < {mb_student.get("student_id")}',
-                                id=year_group.get("id"),
-                                body={"student_ids": [mb_student.get("id")]},
-                            )
-                    # ensure removed from other year_groups
-                else:
-                    # no such ps_student, archive the student
-                    execute(
-                        mb.endpoints.archive_a_student,
-                        records,
-                        mb_student.get("student_id"),
-                        id=mb_student.get("id"),
-                        withdrawn_on=date_query_param,
-                    )
+                # if enrolled := ps_student_enrollments[uniq_student_id][uniq_class_id]:
+                #     pass  # print(enrolled)
+                # else:
+                #     to_be_removed[uniq_student_id][uniq_class_id] = SimpleNamespace(
+                #         student=mb_student, clss=clss
+                #     )
 
         if not provision_only:
-            print("SSs who need CLASSES to be REMOVED")
             for stu_id in to_be_removed:
                 for class_id in to_be_removed[stu_id]:
                     item = to_be_removed[stu_id][class_id]
@@ -777,7 +874,6 @@ def sync(
                         body={"student_ids": [mb_student.get("id")]},
                     )
 
-            print("SS to be UPDATED")
             for stu_id in fields_to_be_updated:
                 for property in fields_to_be_updated[stu_id]:
                     mb_student = mb_students.get(
@@ -853,69 +949,72 @@ def sync(
                             )
 
     finally:
-        timestamp = f"{date_string}{postfix}"
-        df = pd.DataFrame.from_records(records)
-        print(df)
-        df = df.sort_values(by="change", ascending=False)
-        df.to_csv(f"/tmp/executions_{timestamp}.csv", index=False)
-
-        df2 = pd.DataFrame.from_records(missing_classes)
-        # df2 = df2.sort_values(by='change')
-        df2.to_csv(f"/tmp/missing_classes_{timestamp}.csv", index=False)
-
-        subject_description = ""
-        change_description = ""
-        error_description = ""
-        num_errors = len(df.loc[df["error"]])
-        num_changes = len(df.loc[df["change"]])
-        if num_errors > 0:
-            subject_description = f"{num_errors} errors"
-            error_description = (
-                df.loc[df["error"]]["action"]
-                .value_counts()
-                .sort_values(ascending=False)
-                .to_string()
-            )
-
-        if num_changes > 0:
-            subject_description += f" {num_changes} changes"
-            change_description = (
-                df.loc[df["change"]]["action"]
-                .value_counts()
-                .sort_values(ascending=False)
-                .to_string()
-            )
-
-        body = ""
-        if num_errors == 0 and num_changes == 0:
-            body += (
-                "Executed successfully. No changes needed, nor any errors encountered."
-            )
-        if num_errors > 0:
-            body += f"Executed, but some errors happened:\n{error_description}\n\n"
-        if num_changes > 0:
-            body += f"Summary of changes made:\n{change_description}"
-
-        if len(to_whom) > 0:
-            send_email(
-                smtp_user,
-                to_whom,
-                f'Sync Output {"(" if subject_description else ""}{subject_description.strip()}{")" if subject_description else ""}',
-                body,
-                password,
-                ("sync_output.csv", df),
-                ("missing_classes.csv", df2),
-                *[
-                    (f"powerschool_{name}.csv", d)
-                    for name, d in [
-                        ("students", psdf_students),
-                        ("parents", psdf_parents),
-                        ("enrollments", psdf_enrollments),
-                        ("teachers", psdf_teachers),
-                    ]
-                ],
-            )
+        if len(records) == 0:
+            print("no records?")
         else:
-            print(body)
+            timestamp = f"{date_string}{postfix}"
+            df = pd.DataFrame.from_records(records)
+            print(df)
+            #df = df.sort_values(by="change", ascending=False)
+            #df.to_csv(f"/tmp/executions_{timestamp}.csv", index=False)
+
+            df2 = pd.DataFrame.from_records(missing_classes)
+            # df2 = df2.sort_values(by='change')
+            #df2.to_csv(f"/tmp/missing_classes_{timestamp}.csv", index=False)
+
+            subject_description = ""
+            change_description = ""
+            error_description = ""
+            num_errors = len(df.loc[df["error"]])
+            num_changes = len(df.loc[df["change"]])
+            if num_errors > 0:
+                subject_description = f"{num_errors} errors"
+                error_description = (
+                    df.loc[df["error"]]["action"]
+                    .value_counts()
+                    .sort_values(ascending=False)
+                    .to_string()
+                )
+
+            if num_changes > 0:
+                subject_description += f" {num_changes} changes"
+                change_description = (
+                    df.loc[df["change"]]["action"]
+                    .value_counts()
+                    .sort_values(ascending=False)
+                    .to_string()
+                )
+
+            body = ""
+            if num_errors == 0 and num_changes == 0:
+                body += (
+                    "Executed successfully. No changes needed, nor any errors encountered."
+                )
+            if num_errors > 0:
+                body += f"Executed, but some errors happened:\n{error_description}\n\n"
+            if num_changes > 0:
+                body += f"Summary of changes made:\n{change_description}"
+
+            if len(to_whom) > 0:
+                send_email(
+                    smtp_user,
+                    to_whom,
+                    f'Sync Output {"(" if subject_description else ""}{subject_description.strip()}{")" if subject_description else ""}',
+                    body,
+                    smtp_password,
+                    ("sync_output.csv", df),
+                    ("missing_classes.csv", df2),
+                    *[
+                        (f"powerschool_{name}.csv", d)
+                        for name, d in [
+                            ("students", psdf_students),
+                            ("parents", psdf_parents),
+                            ("enrollments", psdf_enrollments),
+                            ("teachers", psdf_teachers),
+                        ]
+                    ],
+                )
+            else:
+                print(body)
 
     return records

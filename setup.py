@@ -9,6 +9,6 @@ setup(
     ],
     entry_points='''
         [mbpy_plugins]
-        sync-asw=powerschool.cli:sync
+        powerschool=powerschool.cli:sync
     ''',
 )
