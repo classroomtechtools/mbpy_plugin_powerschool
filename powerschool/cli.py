@@ -256,7 +256,7 @@ def full_name_to_mb_teacher(ps_stu, mb_teachers, psdf_teachers, records):
             homeroom_teacher_record = hr_teacher_records.pop()
             homeroom_teacher_email = homeroom_teacher_record.get('tables.teachers.id')
             homeroom_teacher_email = homeroom_teacher_email.lower()
-            mb_teacher = mb_teachers.get(homeroom_teacher_email)
+            mb_teacher = mb_teachers.get(homeroom_teacher_email, {"id": None})
             if not mb_teacher:
                 print(f'No teacher with this email? {homeroom_teacher_email}')
                 records.append(
