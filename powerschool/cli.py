@@ -467,6 +467,7 @@ def sync(
                             f"tables.personaddress.guardian{num}_street": "street_address_ii",
                             f"tables.personaddress.guardian{num}_city": "city",
                             f"tables.personaddress.guardian{num}_zipcode": "zipcode",
+                            f"tables.personphonenumberassoc.guardian{num}_phone": "mobile_phone_number"
                         }
                     )[
                         [
@@ -475,6 +476,7 @@ def sync(
                             "street_address_ii",
                             "city",
                             "zipcode",
+                            "mobile_phone_number"
                         ]
                     ]
                     row = matching.to_dict(orient="records").pop()
@@ -482,6 +484,7 @@ def sync(
                     row["state"] = "Texas"
                     entity = mb_parents.get(row.get("email"), {"id": None})
                     mb_id = entity.get("id")
+                    email = row['email']
                     del row['email']
 
                     # Let's see if anything needs updating, if so break out and update in one swoop
@@ -495,7 +498,7 @@ def sync(
                         execute(
                             mb.endpoints.update_parent,
                             records,
-                            row.get("email"),
+                            email,
                             id=mb_id,
                             body={'parent': row}
                         )
@@ -1037,12 +1040,8 @@ def sync(
             timestamp = f"{date_string}{postfix}"
             df = pd.DataFrame.from_records(records)
             print(df)
-            # df = df.sort_values(by="change", ascending=False)
-            # df.to_csv(f"/tmp/executions_{timestamp}.csv", index=False)
-
+            df = df.sort_values(by="error", ascending=False)
             df2 = pd.DataFrame.from_records(missing_classes)
-            # df2 = df2.sort_values(by='change')
-            # df2.to_csv(f"/tmp/missing_classes_{timestamp}.csv", index=False)
 
             subject_description = ""
             change_description = ""
