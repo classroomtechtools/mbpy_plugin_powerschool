@@ -918,9 +918,13 @@ def sync(
             class_happens_on=date_string, classes="active", users="active", per_page=200
         ):
             membership = dot(memb)
-            clss = mb_classes.get(
-                membership.uniq_class_id
-            )  # get_entity_by_key(mb, 'classes', 'uniq_id', membership.class_id)
+            try:
+                clss = mb_classes.get(
+                    membership.uniq_class_id
+                )  # get_entity_by_key(mb, 'classes', 'uniq_id', membership.class_id)
+            except AttributeError:
+                print(f'Missing uniq_class_id for class id={membership.id}')
+                continue
 
             if membership.role == "Student":
                 uniq_student_id = membership.uniq_student_id.strip()
